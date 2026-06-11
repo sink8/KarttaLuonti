@@ -5,6 +5,7 @@ using UnityEngine;
 public class PathPainter : MonoBehaviour
 {
     [Header("Assign these")]
+
     public Terrain terrain;
     public TextAsset trailGeoJson;      // clipped trails .json.txt
 
@@ -12,16 +13,17 @@ public class PathPainter : MonoBehaviour
     public double tileMinE = 590000;
     public double tileMinN = 7362000;
     public double tileSize = 6000;
-    public bool flipX = true;           // matches your flipped heightmap; toggle if mirrored
+    public bool flipX = true;           // toggle if mirrored
 
     [Header("Method A — splatmap paint")]
     public int trailLayerIndex = 0;     // index of your brown trail TerrainLayer
     public float paintWidth = 4f;       // meters
+    public float edgeSoftness = 1.5f;   // cells of fade; bigger = softer
 
     [Header("Method B — ribbon mesh")]
     public Material trailMaterial;
-    public float ribbonWidth = 3f;      // meters
-    public float ribbonLift = 0.2f;     // meters above ground
+    public float ribbonWidth = 3f;
+    public float ribbonLift = 0.2f;
 
     // ---------------- shared ----------------
 
@@ -54,17 +56,12 @@ public class PathPainter : MonoBehaviour
             }
             string block = json.Substring(open, j - open + 1);
 
-            // each "[E,N,Z]" is a point; "],[" separates points within a line,
-            // and a new "[[" after "]]" starts a new sub-line. Split on point groups.
-            // We walk the block and collect numeric pairs, breaking a line whenever
-            // we cross a "]]" boundary (end of a sub-line in MultiLineString).
             var current = new List<Vector3>();
             int k = 0;
             while (k < block.Length) {
                 if (block[k] == '[') {
-                    // is this the start of a coordinate pair (next char is a digit/minus)?
                     int p = k + 1;
-                    while (p < block.Length && (block[p] == ' ')) p++;
+                    while (p < block.Length && block[p] == ' ') p++;
                     if (p < block.Length && (char.IsDigit(block[p]) || block[p] == '-')) {
                         int endPair = block.IndexOf(']', k);
                         string inner = block.Substring(k + 1, endPair - k - 1);
@@ -76,7 +73,6 @@ public class PathPainter : MonoBehaviour
                             else { if (current.Count > 1) result.Add(current); current = new List<Vector3>(); }
                         }
                         k = endPair + 1;
-                        // detect end-of-subline: "]]" closes a sub-line
                         int q = k; while (q < block.Length && block[q] == ' ') q++;
                         if (q < block.Length && block[q] == ']') {
                             if (current.Count > 1) result.Add(current);
@@ -93,41 +89,66 @@ public class PathPainter : MonoBehaviour
         return result;
     }
 
-    // ---------------- METHOD A ----------------
+    Vector2 ToCell(Vector3 worldPos, TerrainData td, int res) {
+        float u = (worldPos.x - terrain.transform.position.x) / td.size.x;
+        float v = (worldPos.z - terrain.transform.position.z) / td.size.z;
+        return new Vector2(u * (res - 1), v * (res - 1));
+    }
+
+    float DistToSegment(Vector2 p, Vector2 a, Vector2 b) {
+        Vector2 ab = b - a;
+        float len2 = ab.sqrMagnitude;
+        if (len2 < 1e-6f) return Vector2.Distance(p, a);
+        float t = Mathf.Clamp01(Vector2.Dot(p - a, ab) / len2);
+        return Vector2.Distance(p, a + t * ab);
+    }
+
+    // ---------------- METHOD A (segment-based, smooth) ----------------
     public void PaintTrails() {
         var td = terrain.terrainData;
         int res = td.alphamapResolution;
         float[,,] splat = td.GetAlphamaps(0, 0, res, res);
         int layers = td.alphamapLayers;
-        if (trailLayerIndex >= layers) { Debug.LogError("trailLayerIndex out of range — add a trail TerrainLayer first."); return; }
+        if (trailLayerIndex >= layers) {
+            Debug.LogError("trailLayerIndex out of range — add a trail TerrainLayer first.");
+            return;
+        }
 
         float radCells = paintWidth / td.size.x * res * 0.5f;
-        int r = Mathf.CeilToInt(radCells);
         var lines = ParseLines();
 
-        foreach (var line in lines)
-            foreach (var p in line) {
-                float u = (p.x - terrain.transform.position.x) / td.size.x;
-                float v = (p.z - terrain.transform.position.z) / td.size.z;
-                int cx = Mathf.RoundToInt(u * (res - 1));
-                int cy = Mathf.RoundToInt(v * (res - 1));
-                for (int dy = -r; dy <= r; dy++)
-                    for (int dx = -r; dx <= r; dx++) {
-                        int x = cx + dx, y = cy + dy;
+        foreach (var line in lines) {
+            for (int seg = 0; seg < line.Count - 1; seg++) {
+                Vector2 a = ToCell(line[seg], td, res);
+                Vector2 b = ToCell(line[seg + 1], td, res);
+
+                int minX = Mathf.FloorToInt(Mathf.Min(a.x, b.x) - radCells - 1);
+                int maxX = Mathf.CeilToInt(Mathf.Max(a.x, b.x) + radCells + 1);
+                int minY = Mathf.FloorToInt(Mathf.Min(a.y, b.y) - radCells - 1);
+                int maxY = Mathf.CeilToInt(Mathf.Max(a.y, b.y) + radCells + 1);
+
+                for (int y = minY; y <= maxY; y++)
+                    for (int x = minX; x <= maxX; x++) {
                         if (x < 0 || y < 0 || x >= res || y >= res) continue;
-                        if (dx * dx + dy * dy > radCells * radCells) continue;
-                        for (int l = 0; l < layers; l++) splat[y, x, l] = (l == trailLayerIndex) ? 1f : 0f;
+                        float dist = DistToSegment(new Vector2(x, y), a, b);
+                        if (dist > radCells + edgeSoftness) continue;
+                        float strength = Mathf.Clamp01((radCells - dist) / edgeSoftness + 0.5f);
+                        float keep = 1f - strength;
+                        for (int l = 0; l < layers; l++)
+                            splat[y, x, l] = (l == trailLayerIndex)
+                                ? splat[y, x, l] * keep + strength
+                                : splat[y, x, l] * keep;
                     }
             }
+        }
         td.SetAlphamaps(0, 0, splat);
-        Debug.Log($"Method A: painted {lines.Count} trail segments.");
+        Debug.Log($"Method A: painted {lines.Count} trails (segment-based).");
     }
 
     // ---------------- METHOD B ----------------
     public void BuildRibbons() {
         if (trailMaterial == null) { Debug.LogError("Assign a Trail Material first."); return; }
 
-        // clear previous run
         var old = GameObject.Find("Trails_Ribbons");
         if (old != null) DestroyImmediate(old);
 
@@ -167,118 +188,11 @@ public class PathPainter : MonoBehaviour
         }
         Debug.Log($"Method B: built {lines.Count} ribbons.");
     }
-
-
-Vector3 WorldToTerrain(double easting, double northing, Terrain terrain) {
-        double tileMinE = 590000, tileMinN = 7362000, tileSize = 6000;
-        float u = (float)((easting - tileMinE) / tileSize); // 0..1 west->east
-        float v = (float)((northing - tileMinN) / tileSize); // 0..1 south->north
-
-        Vector3 size = terrain.terrainData.size;
-        float localX = u * size.x;
-        float localZ = v * size.z;
-        float y = terrain.SampleHeight(new Vector3(localX, 0, localZ) + terrain.transform.position);
-        return new Vector3(localX, y, localZ) + terrain.transform.position;
-    }
-
-    public void PaintLines(TextAsset geojson, Terrain terrain, int trailLayerIndex, float widthMeters) {
-        var td = terrain.terrainData;
-        int res = td.alphamapResolution;
-        float[,,] splat = td.GetAlphamaps(0, 0, res, res);
-        var lines = ParseLines(geojson.text, terrain);
-
-        int layers = td.alphamapLayers;
-        float radCells = widthMeters / td.size.x * res * 0.5f;
-
-        foreach (var line in lines)
-            foreach (var p in line.points) {
-                // local pos back to 0..1 then to alphamap cell
-                float u = (p.x - terrain.transform.position.x) / td.size.x;
-                float v = (p.z - terrain.transform.position.z) / td.size.z;
-                int cx = Mathf.RoundToInt(u * (res - 1));
-                int cy = Mathf.RoundToInt(v * (res - 1));
-                int r = Mathf.CeilToInt(radCells);
-                for (int dy = -r; dy <= r; dy++)
-                    for (int dx = -r; dx <= r; dx++) {
-                        int x = cx + dx, y = cy + dy;
-                        if (x < 0 || y < 0 || x >= res || y >= res) continue;
-                        if (dx * dx + dy * dy > radCells * radCells) continue;
-                        for (int l = 0; l < layers; l++) splat[y, x, l] = (l == trailLayerIndex) ? 1f : 0f;
-                    }
-            }
-        td.SetAlphamaps(0, 0, splat);
-        Debug.Log("Lines painted into splatmap.");
-    }
-
-    public void BuildРibbons(TextAsset geojson, Terrain terrain, Material trailMat, float widthMeters) {
-        var lines = ParseLines(geojson.text, terrain);
-        float half = widthMeters * 0.5f;
-
-        foreach (var line in lines) {
-            if (line.points.Count < 2) continue;
-            var verts = new List<Vector3>();
-            var tris = new List<int>();
-            var uvs = new List<Vector2>();
-
-            for (int i = 0; i < line.points.Count; i++) {
-                Vector3 fwd = (i < line.points.Count - 1)
-                    ? (line.points[i + 1] - line.points[i]).normalized
-                    : (line.points[i] - line.points[i - 1]).normalized;
-                Vector3 sideDir = Vector3.Cross(Vector3.up, fwd).normalized;
-                Vector3 lift = Vector3.up * 0.15f; // sit just above ground
-                verts.Add(line.points[i] - sideDir * half + lift);
-                verts.Add(line.points[i] + sideDir * half + lift);
-                uvs.Add(new Vector2(0, i)); uvs.Add(new Vector2(1, i));
-            }
-            for (int i = 0; i < line.points.Count - 1; i++) {
-                int b = i * 2;
-                tris.AddRange(new[] { b, b + 2, b + 1, b + 1, b + 2, b + 3 });
-            }
-
-            var go = new GameObject("Trail");
-            var mf = go.AddComponent<MeshFilter>();
-            var mr = go.AddComponent<MeshRenderer>();
-            mr.sharedMaterial = trailMat;
-            var m = new Mesh { indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
-            m.SetVertices(verts); m.SetTriangles(tris, 0); m.SetUVs(0, uvs);
-            m.RecalculateNormals();
-            mf.sharedMesh = m;
-        }
-        Debug.Log("Trail ribbons built.");
-    }
-
-    [System.Serializable]
-public class LineFeature { public List<Vector3> points = new List<Vector3>(); }
-
-List<LineFeature> ParseLines(string json, Terrain terrain) {
-    var result = new List<LineFeature>();
-    // crude but effective: find each "coordinates":[ ... ] block of a LineString
-    int i = 0;
-    while ((i = json.IndexOf("LineString", i)) != -1) {
-        int c = json.IndexOf("coordinates", i);
-        int open = json.IndexOf('[', c);
-        int close = json.IndexOf(']', open);
-        // grab inner pairs: [[e,n],[e,n],...]
-        int blockEnd = json.IndexOf("]]", open);
-        string block = json.Substring(open, blockEnd - open + 2);
-        var feat = new LineFeature();
-        foreach (var pair in block.Split(new[] { "],[" }, System.StringSplitOptions.None)) {
-            var nums = pair.Replace("[", "").Replace("]", "").Split(',');
-            if (nums.Length >= 2 &&
-                double.TryParse(nums[0], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double e) &&
-                double.TryParse(nums[1], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double n))
-                feat.points.Add(WorldToTerrain(e, n, terrain));
-        }
-        if (feat.points.Count > 1) result.Add(feat);
-        i = blockEnd;
-    }
-    return result;
 }
 
-}
 #if UNITY_EDITOR
 [UnityEditor.CustomEditor(typeof(PathPainter))]
-public class TrailMapperEditor : UnityEditor.Editor {
+public class PathPainterEditor : UnityEditor.Editor {
     public override void OnInspectorGUI() {
         DrawDefaultInspector();
         var t = (PathPainter)target;
